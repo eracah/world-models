@@ -43,46 +43,44 @@ from torchvision.utils import make_grid
 # In[2]:
 
 
-test_notebook = False
-if "ipykernel_launcher" in sys.argv[0]:
-    sys.argv = [""]
-    test_notebook= True
-import argparse
+if __name__ == "__main__":
+    test_notebook = False
+    if "ipykernel_launcher" in sys.argv[0]:
+        sys.argv = [""]
+        test_notebook= True
+    import argparse
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--weights_file",type=str,default="None")
-parser.add_argument("--lr",type=float, default=0.001)
-parser.add_argument("--opt",type=str, default="adam")
-parser.add_argument("--rollouts",type=int, default=4)
-parser.add_argument("--batch_size",type=int, default=128)
-parser.add_argument("--savedir",type=str, default="/data/milatmp1/racaheva")
-args = parser.parse_args()
-
-
-# In[3]:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--weights_file",type=str,default="None")
+    parser.add_argument("--lr",type=float, default=0.001)
+    parser.add_argument("--opt",type=str, default="adam")
+    parser.add_argument("--rollouts",type=int, default=4)
+    parser.add_argument("--batch_size",type=int, default=128)
+    parser.add_argument("--savedir",type=str, default="/data/milatmp1/racaheva")
+    args = parser.parse_args()
 
 
-len_action = 3
-rollout_len = 1000
-basename="vae"
-def mkstr(key):
-    d = args.__dict__
-    return "=".join([key,str(d[key])])
+    len_action = 3
+    rollout_len = 1000
+    basename="vae"
+    def mkstr(key):
+        d = args.__dict__
+        return "=".join([key,str(d[key])])
+    shuffle = True
+    output_dirname = "_".join([basename,mkstr("lr"),mkstr("rollouts"),mkstr("batch_size"),mkstr("opt"),"shuffle=%s"%str(shuffle)])
 
-output_dirname = "_".join([basename,mkstr("lr"),mkstr("rollouts"),mkstr("batch_size"),mkstr("opt")])
+    if test_notebook:
+        output_dirname = "notebook_" + output_dirname
+    saved_model_dir = os.path.join(args.savedir,("models/%s" % output_dirname))
+    log_dir = os.path.join(args.savedir,'.%s_logs/%s'%(basename,output_dirname))
+    az_pair_dir = os.path.join(args.savedir,("az_pairs/%s" % output_dirname))
+    writer = SummaryWriter(log_dir=log_dir)
 
-if test_notebook:
-    output_dirname = "notebook_" + output_dirname
-saved_model_dir = os.path.join(args.savedir,("models/%s" % output_dirname))
-log_dir = os.path.join(args.savedir,('.logs/%s'%output_dirname))
-az_pair_dir = os.path.join(args.savedir,("az_pairs/%s" % output_dirname))
-writer = SummaryWriter(log_dir=log_dir)
+    if not os.path.exists(az_pair_dir):
+        os.makedirs(az_pair_dir)
 
-if not os.path.exists(az_pair_dir):
-    os.makedirs(az_pair_dir)
-
-if not os.path.exists(saved_model_dir):
-    os.makedirs(saved_model_dir)
+    if not os.path.exists(saved_model_dir):
+        os.makedirs(saved_model_dir)
 
 
 # In[4]:
@@ -172,7 +170,7 @@ def make_frame_iterator(frames,batch_size=128,env_name="CarRacing-v0"):
     rds = FrameDataset(frames,transform=transforms)
 
 
-    frame_iter = DataLoader(rds,batch_size=batch_size)
+    frame_iter = DataLoader(rds,batch_size=batch_size,shuffle=True) # hopefully this will encourage vae to learn curves
     return frame_iter
     
 
@@ -199,7 +197,7 @@ def print_info(mode,loss,t0,it):
     #print("%s Accuracy for epoch %i: %8.4f"%(mode.capitalize(),epoch,acc))
 
 
-# In[9]:
+# In[45]:
 
 
 class VAE(nn.Module):
@@ -231,7 +229,7 @@ class VAE(nn.Module):
             nn.ReLU(),
             nn.ConvTranspose2d(in_channels=32,out_channels=3,kernel_size=6,stride=2),
             nn.Sigmoid())
-        
+
         self._initialize_weights()
 
     def forward(self,x):
@@ -252,9 +250,14 @@ class VAE(nn.Module):
         
     
     def reparameterize(self,mu,sigma):
-        eps = Variable(torch.Tensor(*sigma.size()).normal_()).cuda()
-        z = mu + eps*sigma
-        return z
+        if self.training:
+            eps = Variable(torch.randn(*sigma.size()))
+            if sigma.is_cuda:
+                eps = eps.cuda()
+            z = mu + eps*sigma
+            return z
+        else:
+            return mu
     
     def _initialize_weights(self):
         # Official init from torch repo.
@@ -290,11 +293,12 @@ def vae_loss(x,xr,mu,sigma):
 #     return BCE + KLD 
 
 
-# In[11]:
+# In[50]:
 
 
 if __name__ == "__main__":
     V = VAE().cuda()
+    V.train()
     all_actions = np.zeros((args.rollouts,rollout_len+1,len_action))
     all_z = np.zeros((args.rollouts,rollout_len+1,V.nz))
     az_fn = os.path.join(az_pair_dir,"az.npz")
@@ -305,7 +309,6 @@ if __name__ == "__main__":
         frames,actions = generate_rollout()
         actions = all_actions[epoch,:rollout_len] = actions
         dataloader = make_frame_iterator(frames)
-        V.train()
         it_losses = []
         zs = []
         opt.zero_grad()
@@ -319,6 +322,8 @@ if __name__ == "__main__":
             writer.add_image("x_rec", xr_grid, epoch)
             x_grid = make_grid(xv.data[:num_ims],rows)
             writer.add_image("x_orig", x_grid, epoch)
+            
+            
             zs.append(z)
             loss = criterion(xv,xr,mu,sigma)
             it_losses.append(loss.data[0])
@@ -331,6 +336,7 @@ if __name__ == "__main__":
         all_z[epoch,:,:] = zs
         #az = zip(torch.from_numpy(actions),zs)
         writer.add_scalar("loss",scalar_value=loss,global_step=epoch)
+        #save weights as cpu weights
         torch.save(V.state_dict(), '%s/currVAE.pth' % (saved_model_dir))
         if epoch % 100 == 0:
             np.savez(az_fn,a=all_actions,z=all_z)
